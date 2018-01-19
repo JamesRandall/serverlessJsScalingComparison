@@ -1,0 +1,207 @@
+    <h1 class='post-title'><a href='/expressingStrongOpinionsThroughCode'>Expressing Strong Opinions Through Code</a></h1><div class='post-metadata'>Posted on <a href='/archive/2018/01'>Wednesday, January 10, 2018</a> by James Randall</div>
+
+<p>Synopsis: a solution and its code should clearly communicate strong opinions about how it is structured, where things belong, and how things are done. Should be obvious where things fit and cause noticeable friction when people try and do things &quot;off the rails&quot;. Important for large teams to cooperate.</p>
+
+
+        <div class="post-spacer"></div>
+    <h1 class='post-title'><a href='/dealingWithDynamicDataAlmostWithoutReflection'>Dealing With Dynamic Data (Almost) Without Reflection</a></h1><div class='post-metadata'>Posted on <a href='/archive/2017/12'>Friday, December 29, 2017</a> by James Randall</div>
+
+<p>Often you need to manipulate a data structure without knowing it's shape at compile time, for example when authoring classes that expose generic interfaces or dealing with data described by runtime metadata (database schema, JSON files etc.).</p>
+<p>For example consider a method that is designed to generate a hashcode from the public properties of an arbitary type. Firstly let's look at a model and a typical hashcode implementation:</p>
+<pre><code>class SimpleModel
+{
+    public string Surname { get; set; }
+
+    public string Forename { get; set; }
+
+    public int Age { get; set; }
+
+    public string Description { get; set; }
+
+    public override bool Equals(object obj)
+    {
+        if (obj is SimpleModel comparisonObject)
+        {
+            return Equals(comparisonObject);
+        }
+        return false;
+    }
+
+    protected bool Equals(SimpleModel other)
+    {
+        return string.Equals(Surname, other.Surname) &amp;&amp; string.Equals(Forename, other.Forename) &amp;&amp; Age == other.Age;
+    }
+
+    public override int GetHashCode()
+    {
+        unchecked
+        {
+            var hashCode = (Surname != null ? Surname.GetHashCode() : 0);
+            hashCode = (hashCode * 397) ^ (Forename != null ? Forename.GetHashCode() : 0);
+            hashCode = (hashCode * 397) ^ (Description != null ? Description.GetHashCode() : 0);
+            hashCode = (hashCode * 397) ^ Age;
+            return hashCode;
+        }
+    }
+}
+</code></pre>
+<p>If we want to use a similar hashcode approach but against a generic type we might use reflection to implement something like the followiong:</p>
+<pre><code>class HashcodeGenerator
+{
+    public int GetHashCodeForArbitaryType&lt;TType&gt;(TType complexObject)
+    {
+        Type objectType = complexObject.GetType();
+        PropertyInfo[] properties = objectType.GetProperties().OrderByDescending(x =&gt; x.Name).ToArray();
+        
+        object firstValue = properties[0].GetValue(complexObject);
+        int hashCode = firstValue?.GetHashCode() ?? 0;
+
+        for (int propertyIndex=1; propertyIndex &lt; properties.Length; propertyIndex++)
+        {
+            object value = properties[propertyIndex].GetValue(complexObject);
+            unchecked
+            {
+                hashCode = (hashCode * 397) ^ (value?.GetHashCode() ?? 0);
+            }
+        }
+        return hashCode;
+    }
+}
+</code></pre>
+<p>This gets the properties from the type and then generates a hashcode in the same way. While this implementation will work reflection is notoriously expensive - generating 1 million hashcodes for our simple model takes around 4.5 seconds on my laptop and more complex examples can quickly escalate into much worse performance and the more complex the model the worse the performance. I've certainly worked on systems where the cost was simply too high and we've been forced to consider alternative approaches: eliminating reflection was definitely not a micro-optimisation.</p>
+<p>One option is to use the Expression framework to build an abstract syntax tree and compile it into IL at runtime. While most people are familiar with the Func&lt;&gt; and Action&lt;&gt; support in C# for functional style programming an Expression Tree framework introduced alongside it seems to have gone much more under the radar but is incredibly useful allowing you to compile code at runtime which, when used appropriately, can lead to massive performance improvements in data driven designs.</p>
+<p>A syntax tree is, as the name suggests, a tree representation of source code with each node of the tree corresponding to a source code construct for example calling a method or a comparison operator. Consider the following C# code:</p>
+<pre><code>public static Func&lt;int&gt; GetSimpleAddFunc()
+{
+    BinaryExpression add = Expression.Add(Expression.Constant(5), Expression.Constant(4));
+    Expression&lt;Func&lt;int&gt;&gt; lambda = Expression.Lambda&lt;Func&lt;int&gt;&gt;(add);
+    return lambda.Compile();
+}
+
+public static void DoAddition()
+{
+
+    Func&lt;int&gt; addFunc = GetAddFunc();
+    int result = addFunc();
+}
+</code></pre>
+<p>The <em>GetAddFunc()</em> function returns a typical Func<int> but one that is compiled at runtime. To do this we first build a simple tree comprised of an addition operator and two constant nodes. The addition operator is a kind of binary expression - a node that has left and right child nodes. Whereas the the constant nodes are simple value nodes that have no children. Finally we wrap the addition node in a lambda expression of type Func<int>. Lambda expressions represent an entry point for the execution of an expression and as such support compilation.</p>
+<p>Following this we can use the compiled function exactly as we would a normal function we've compiled from source code.</p>
+<p>What if we want to be able to pass the values to add into our function?  We can use an expression node called a ParameterExpression to allow us to declare placeholders for values that are passed into the expression and these will take the form of parameters on our func:</p>
+<pre><code>public static Func&lt;int, int, int&gt; GetAddFunc()
+{
+    ParameterExpression value1 = Expression.Parameter(typeof(int));
+    ParameterExpression value2 = Expression.Parameter(typeof(int));
+
+    BinaryExpression add = Expression.Add(value1, value2);
+    Expression&lt;Func&lt;int, int, int&gt;&gt; lambda = Expression.Lambda&lt;Func&lt;int, int, int&gt;&gt;(add, value1, value2);
+    return lambda.Compile();
+}
+
+public static void DoAddition()
+{
+
+    Func&lt;int, int, int&gt; addFunc = GetAddFunc();
+    int result = addFunc(9,5);
+}
+</code></pre>
+<p>There are a wide variety of expression nodes and amongst many other things we can call methods, get from properties, and perform comparisons - if you can write the code you can build the equivelant in a syntax tree.</p>
+<p>Going back to our data driven hashcode problem we can combine the Expression framework with our reflection example to inspect the C# types and compile code that generates a hashcode specifically for our type so that once we've undertaken the initial compilation we really are just using compiled C# code to process our runtime discovered type. It's a bit of a leap in complexity and will introduce some further node types but an example implementation of this technique looks like this:</p>
+<pre><code>public Func&lt;TType, int&gt; GetHashCodeForArbitaryTypeFunc&lt;TType&gt;()
+{
+    Type objectType = typeof(TType);
+    PropertyInfo[] properties = objectType.GetProperties().OrderByDescending(x =&gt; x.Name).ToArray();
+    
+    ParameterExpression parameter = Expression.Parameter(objectType);
+    ParameterExpression hashcodeVariable = Expression.Variable(typeof(int));
+
+    List&lt;Expression&gt; blockExpressions = new List&lt;Expression&gt;
+    {
+        Expression.Assign(hashcodeVariable, Expression.Condition(
+            Expression.Equal(
+                Expression.Convert(Expression.Property(parameter, properties[0]), typeof(object)), Expression.Constant(null)),
+                Expression.Constant(0),
+                Expression.Call(Expression.Property(parameter, properties[0]), properties[0].PropertyType.GetMethod(&quot;GetHashCode&quot;, new Type[0]))))
+    };
+
+    if (properties.Length &gt; 1)
+    {
+        blockExpressions.AddRange(properties.Skip(1).Select(p =&gt;
+            Expression.Assign(hashcodeVariable, Expression.ExclusiveOr(
+                Expression.Multiply(hashcodeVariable, Expression.Constant(397)),
+                Expression.Condition(
+                    Expression.Equal(
+                        Expression.Convert(Expression.Property(parameter, p), typeof(object)), Expression.Constant(null)),
+                        Expression.Constant(0),
+                        Expression.Call(Expression.Property(parameter, p), p.PropertyType.GetMethod(&quot;GetHashCode&quot;, new Type[0])))
+            ))));
+    }
+    
+    Expression&lt;Func&lt;TType, int&gt;&gt; lambda = Expression.Lambda&lt;Func&lt;TType, int&gt;&gt;(
+        Expression.Block(new[] { hashcodeVariable}, blockExpressions),
+        parameter);
+
+    return lambda.Compile();
+}
+</code></pre>
+<p>Firstly lets compare the performance - does this yield the performance improvement I promised? On the same laptop the performance of this is much improved - while the reflection based example took 4.2 seconds for generating 1 million hashcodes this new approach gives exactly the same hashcode for a given object but generates 1 million hashcodes in only 0.5 seconds, so around an 8x improvement in performance. Repeated reruns give fairly consistent results. It's worth also noting that the bigger the model the bigger the savings. If I run the same tests with a 10 property model the reflection approach takes 8 seconds while the expression based approach still clocks in at around 0.5 seconds.</p>
+<p>If we start to break down the above you can see how the structure roughly follows that of our reflection implementation but instead of directly evaluating the hashcode it expresses each step as part of a syntax tree and finally bundles it into a lambda and compiles it into a Func&lt;&gt; we can call directly.</p>
+<p>One of the key new node types introduced above is the block expression. This basically represents a scoped set of lines of code - essentially the equivelant of a { } brace block in C# and as such it's factory method (Expression.Block) accepts an array of expression nodes that will be run in sequence and these are passed as the second parameter to the factory. As we are declaring a scope we can also state any variables that belong to it and in this case we are making use of an integer variable to store our hashcode.</p>
+<p>We also make use of conditional expression nodes created with the Expression.Condition factory method. These take an expression to be evaluated (the first parameter) and if true will return the evaluation of the expression used as the second parameter and if false the third parameter. We're also doing casting to object as part of our conditional check so we can consistently look at value types and reference types. If we don't cast this and compare a value type to a reference type then during compilation of the expression, at runtime, we will receive an error. Given we're using code to write code and know if the type is a value type we could always check to see if this is the case and emit the comparison to null in this case - however for the sake of keeping the example clear I've left this step out.</p>
+<p>Finally we make use of methods and properties through expression nodes through the Expression.Property and Expression.Call factories respectively. In each case the first parameter is an expression that returns the object to execute against and the second parameter is PropertyInfo or MethodInfo respectively.</p>
+<p>It's worth noting there is a compile cost to this approach however this is fairly nominal (around 0.004 seconds for our example on my laptop) but given we're likely considering this approach to deal with a performance sensitive scenario it's best to buffer this by using a lazy caching factory pattern otherwise if we build the expression and compile each time we run into the model type then our savings will be lost. An example of this is shown in the sample below:</p>
+<pre><code>class CachingHashCodeFuncFactory : ICachingHashCodeFuncFactor
+{
+    private readonly ConcurrentDictionary&lt;Type, Delegate&gt; _compiledFunctions =
+        new ConcurrentDictionary&lt;Type, Delegate&gt;();
+
+    public Func&lt;TType, int&gt; GetHashCodeFunc&lt;TType&gt;()
+    {
+        Type type = typeof(TType);
+        Delegate func = _compiledFunctions.GetOrAdd(type, obj =&gt; GetHashCodeForArbitaryTypeFunc&lt;TType&gt;());
+        return (Func&lt;TType, int&gt;)func;
+    }
+
+    private static Func&lt;TType, int&gt; GetHashCodeForArbitaryTypeFunc&lt;TType&gt;()
+    {
+        Type objectType = typeof(TType);
+        PropertyInfo[] properties = objectType.GetProperties().OrderByDescending(x =&gt; x.Name).ToArray();
+
+        ParameterExpression parameter = Expression.Parameter(objectType);
+        ParameterExpression hashcodeVariable = Expression.Variable(typeof(int));
+
+        List&lt;Expression&gt; blockExpressions = new List&lt;Expression&gt;
+        {
+            Expression.Assign(hashcodeVariable, Expression.Condition(
+                Expression.Equal(
+                    Expression.Convert(Expression.Property(parameter, properties[0]), typeof(object)), Expression.Constant(null)),
+                Expression.Constant(0),
+                Expression.Call(Expression.Property(parameter, properties[0]), properties[0].PropertyType.GetMethod(&quot;GetHashCode&quot;, new Type[0]))))
+        };
+
+        if (properties.Length &gt; 1)
+        {
+            blockExpressions.AddRange(properties.Skip(1).Select(p =&gt;
+                Expression.Assign(hashcodeVariable, Expression.ExclusiveOr(
+                    Expression.Multiply(hashcodeVariable, Expression.Constant(397)),
+                    Expression.Condition(
+                        Expression.Equal(
+                            Expression.Convert(Expression.Property(parameter, p), typeof(object)), Expression.Constant(null)),
+                        Expression.Constant(0),
+                        Expression.Call(Expression.Property(parameter, p), p.PropertyType.GetMethod(&quot;GetHashCode&quot;, new Type[0])))
+                ))));
+        }
+
+        Expression&lt;Func&lt;TType, int&gt;&gt; lambda = Expression.Lambda&lt;Func&lt;TType, int&gt;&gt;(
+            Expression.Block(new[] { hashcodeVariable }, blockExpressions),
+            parameter);
+
+        return lambda.Compile();
+    }
+}
+</code></pre>
+<p>We've now got a dictionary lookup to account for but tests on my laptop show that this only increases the time to generate 1 million hashes to 0.6 seconds, a 0.1 second overhead, and still nearly 10x faster than the original reflection approach. I've used a concurrent dictionary in the above as it seems likely that a class like this would be registered as a singleton in your IoC container and need to be thread safe.</p>
+<p>It is, I hope, fairly to see how this kind of approach can be used for compiling code to do all sorts of things wherever metadata is available - for example instead of using reflection we could use exactly the same approach for compiling code to manipulate JSON based on a JSON schema.</p>
+<p>As a final aside if you run the sample app and have done previous work with hashcode's in .Net something that might strike you as odd is that the hashcode will change on each execution. This is because the hashcode algorithm has changed with .Net Core. Whereas in Framework the hashcode would only change &quot;between frameworks and domain&quot; (so between frameworks and potentially between compilations) in Core it will change on every execution. While it's dangerous to on hashcodes in this manner I stil suspect this is something that will catch people out.</p>
+
+
